@@ -1,0 +1,15 @@
+# *
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /owner
+Disallow: /shipper
+Disallow: /shipping-unit
+Disallow: /profile
+Disallow: /checkout
+
+# Host
+Host: https://giadung24h.vn
+
+# Sitemaps
+Sitemap: https://giadung24h.vn/sitemap.xml

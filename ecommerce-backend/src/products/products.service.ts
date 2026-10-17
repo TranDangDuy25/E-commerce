@@ -1,0 +1,659 @@
+import { BadRequestException, Injectable, NotFoundException, OnModuleInit, Inject, forwardRef } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { FilterQuery, Model, Types } from 'mongoose';
+import { buildPaginationMeta, getPagination } from '../common/helpers/pagination.helper';
+import { createSlug } from '../common/helpers/slug.helper';
+import { CategoriesService } from '../categories/categories.service';
+import { CreateProductDto } from './dto/create-product.dto';
+import { ProductQueryDto } from './dto/product-query.dto';
+import { UpdateProductDto } from './dto/update-product.dto';
+import { Product, ProductDocument, ProductStatus } from '../database/schemas/product.schema';
+import { Counter, CounterDocument } from '../database/schemas/counter.schema';
+import { User, UserDocument } from '../database/schemas/user.schema';
+import {
+  DiscountValueType,
+  PriceAdjustmentType,
+  ProductPriceSchedule,
+  ProductPriceScheduleDocument,
+  ScheduleStatus,
+} from '../database/schemas/product-price-schedule.schema';
+import { CreatePriceScheduleDto } from './dto/create-price-schedule.dto';
+import { PriceSchedulerService } from './price-scheduler.service';
+import { UploadTargetType, UploadType } from '../database/schemas/upload.schema';
+import { UploadService } from '../upload/upload.service';
+import { InventoryLogsService } from '../inventory-logs/inventory-logs.service';
+import { InventoryLogType } from '../database/schemas/inventory-log.schema';
+import { AiService } from '../ai/ai.service';
+
+@Injectable()
+export class ProductsService implements OnModuleInit {
+  constructor(
+    @InjectModel(Product.name) private readonly productModel: Model<ProductDocument>,
+    @InjectModel(Counter.name) private readonly counterModel: Model<CounterDocument>,
+    @InjectModel(User.name) private readonly userModel: Model<UserDocument>,
+    @InjectModel(ProductPriceSchedule.name)
+    private readonly priceScheduleModel: Model<ProductPriceScheduleDocument>,
+    private readonly categoriesService: CategoriesService,
+    private readonly uploadService: UploadService,
+    private readonly inventoryLogsService: InventoryLogsService,
+    private readonly aiService: AiService,
+    @Inject(forwardRef(() => PriceSchedulerService))
+    private readonly priceSchedulerService: PriceSchedulerService,
+  ) {}
+
+
+
+  async onModuleInit() {
+    await this.assignIdsToExistingProducts();
+  }
+
+  async create(createProductDto: CreateProductDto, createdBy: string) {
+    await this.categoriesService.findOne(createProductDto.categoryId);
+
+    const slug = createSlug(createProductDto.slug || createProductDto.name);
+    await this.ensureSlugAvailable(slug);
+    const productId = await this.getNextProductId();
+    const productObjectId = new Types.ObjectId();
+    const { imageUploadIds, ...productData } = createProductDto;
+    const images = imageUploadIds
+      ? await this.uploadService.attachUploads(
+          createdBy,
+          imageUploadIds,
+          UploadType.ProductImage,
+          UploadTargetType.Product,
+          productObjectId,
+        )
+      : [];
+
+    const product = await this.productModel.create({
+      _id: productObjectId,
+      ...productData,
+      images,
+      productId,
+      slug,
+      createdBy: new Types.ObjectId(createdBy),
+    });
+
+    // Tạo embedding ngầm định để tránh block response quá lâu
+    this.aiService.generateEmbedding(`${productData.name}. ${productData.description || ''}`).then(embedding => {
+      if (embedding.length > 0) {
+        this.productModel.findByIdAndUpdate(productObjectId, { embedding }).exec();
+      }
+    }).catch(err => console.error('Lỗi khi tạo embedding:', err));
+
+    if (productData.stock) {
+      await this.inventoryLogsService.createLog(
+        productObjectId,
+        productData.stock,
+        InventoryLogType.RESTOCK,
+        undefined,
+        'Initial stock',
+      );
+    }
+
+    return product;
+  }
+
+  async findAll(query: ProductQueryDto) {
+    const { page, limit, skip } = getPagination(query);
+    const filter = this.buildFilter(query);
+
+    if (query.storeName) {
+      const users = await this.userModel
+        .find({
+          $or: [
+            { storeName: new RegExp(query.storeName, 'i') },
+            { fullName: new RegExp(query.storeName, 'i') },
+          ],
+        })
+        .select('_id')
+        .exec();
+
+      if (users.length === 0) {
+        return {
+          items: [],
+          meta: buildPaginationMeta(0, page, limit),
+        };
+      }
+      filter.createdBy = { $in: users.map((u) => u._id) };
+    }
+
+    const sortField = query.sortBy || 'createdAt';
+
+    const sortOrder = query.sortOrder === 'asc' ? 1 : -1;
+
+    const [items, total] = await Promise.all([
+      this.productModel
+        .find(filter)
+        .populate('categoryId', 'name slug')
+        .populate('createdBy', 'fullName email storeName storePhone')
+        .sort({ [sortField]: sortOrder })
+        .skip(skip)
+        .limit(limit)
+        .exec(),
+      this.productModel.countDocuments(filter).exec(),
+    ]);
+
+    return {
+      items,
+      meta: buildPaginationMeta(total, page, limit),
+    };
+  }
+
+  async findAllByOwner(ownerId: string, query: ProductQueryDto) {
+    const { page, limit, skip } = getPagination(query);
+    const filter = {
+      ...this.buildFilter(query),
+      createdBy: new Types.ObjectId(ownerId),
+    };
+    const sortField = query.sortBy || 'createdAt';
+    const sortOrder = query.sortOrder === 'asc' ? 1 : -1;
+
+    const [items, total] = await Promise.all([
+      this.productModel
+        .find(filter)
+        .populate('categoryId', 'name slug')
+        .sort({ [sortField]: sortOrder })
+        .skip(skip)
+        .limit(limit)
+        .exec(),
+      this.productModel.countDocuments(filter).exec(),
+    ]);
+
+    return { items, meta: buildPaginationMeta(total, page, limit) };
+  }
+
+  async getInventoryLogsByOwner(ownerId: string, page: number = 1, limit: number = 10) {
+    // 1. Get all products created by this owner
+    const products = await this.productModel
+      .find({ createdBy: new Types.ObjectId(ownerId) })
+      .select('_id')
+      .exec();
+    
+    if (products.length === 0) {
+      return { items: [], meta: buildPaginationMeta(0, page, limit) };
+    }
+
+    const productIds = products.map((p) => p._id as Types.ObjectId);
+    
+    // 2. Get inventory logs for those products
+    return this.inventoryLogsService.getLogsByProducts(productIds, page, limit);
+  }
+
+  async findOne(idOrSlug: number | string) {
+    const query: FilterQuery<ProductDocument> = { status: { $ne: ProductStatus.Deleted } };
+    
+    // Check if idOrSlug is a number (productId) or a string (slug)
+    const isNumeric = !isNaN(Number(idOrSlug));
+    if (isNumeric) {
+      query.productId = Number(idOrSlug);
+    } else {
+      query.slug = idOrSlug;
+    }
+
+    const product = await this.productModel
+      .findOne(query)
+      .populate('categoryId', 'name slug')
+      .populate('createdBy', 'fullName email storeName storePhone')
+      .exec();
+
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+
+    return product;
+  }
+
+  async update(id: number, updateProductDto: UpdateProductDto, updatedBy: string) {
+    const product = await this.findOne(id);
+    const updatePayload: Record<string, unknown> = { ...updateProductDto };
+    delete updatePayload.imageUploadIds;
+
+    if (updateProductDto.categoryId) {
+      await this.categoriesService.findOne(updateProductDto.categoryId);
+    }
+
+    const slugSource = updateProductDto.slug || updateProductDto.name;
+    if (slugSource) {
+      const slug = createSlug(slugSource);
+      await this.ensureSlugAvailable(slug, product._id.toString());
+      updatePayload.slug = slug;
+    }
+
+    if (updateProductDto.imageUploadIds) {
+      updatePayload.images = await this.uploadService.attachUploads(
+        updatedBy,
+        updateProductDto.imageUploadIds,
+        UploadType.ProductImage,
+        UploadTargetType.Product,
+        product._id,
+      );
+    }
+
+    // Cập nhật lại embedding nếu thay đổi name hoặc description
+    if (updateProductDto.name !== undefined || updateProductDto.description !== undefined) {
+      const newName = updateProductDto.name ?? product.name;
+      const newDesc = updateProductDto.description ?? product.description;
+      this.aiService.generateEmbedding(`${newName}. ${newDesc || ''}`).then(embedding => {
+        if (embedding.length > 0) {
+          this.productModel.findByIdAndUpdate(product._id, { embedding }).exec();
+        }
+      }).catch(err => console.error('Lỗi cập nhật embedding:', err));
+    }
+
+    const updatedProduct = await this.productModel
+      .findByIdAndUpdate(product._id, updatePayload, { new: true })
+      .populate('categoryId', 'name slug')
+      .populate('createdBy', 'fullName email storeName storePhone')
+      .exec();
+
+    if (!updatedProduct) {
+      throw new NotFoundException('Product not found');
+    }
+
+    if (updateProductDto.stock !== undefined && updateProductDto.stock !== product.stock) {
+      const stockChange = updateProductDto.stock - product.stock;
+      await this.inventoryLogsService.createLog(
+        product._id,
+        stockChange,
+        InventoryLogType.UPDATE,
+        undefined,
+        'Admin updated stock',
+      );
+    }
+
+    return updatedProduct;
+  }
+
+  async updateByOwner(id: number, ownerId: string, updateProductDto: UpdateProductDto) {
+    const product = await this.productModel
+      .findOne({
+        productId: id,
+        createdBy: new Types.ObjectId(ownerId),
+        status: { $ne: ProductStatus.Deleted },
+      })
+      .exec();
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+    const updatePayload: Record<string, unknown> = { ...updateProductDto };
+    delete updatePayload.imageUploadIds;
+
+    if (updateProductDto.categoryId) {
+      await this.categoriesService.findOne(updateProductDto.categoryId);
+    }
+
+    const slugSource = updateProductDto.slug || updateProductDto.name;
+    if (slugSource) {
+      const slug = createSlug(slugSource);
+      await this.ensureSlugAvailable(slug, product._id.toString());
+      updatePayload.slug = slug;
+    }
+
+    if (updateProductDto.imageUploadIds) {
+      updatePayload.images = await this.uploadService.attachUploads(
+        ownerId,
+        updateProductDto.imageUploadIds,
+        UploadType.ProductImage,
+        UploadTargetType.Product,
+        product._id,
+      );
+    }
+
+    // Cập nhật lại embedding nếu thay đổi name hoặc description
+    if (updateProductDto.name !== undefined || updateProductDto.description !== undefined) {
+      const newName = updateProductDto.name ?? product.name;
+      const newDesc = updateProductDto.description ?? product.description;
+      this.aiService.generateEmbedding(`${newName}. ${newDesc || ''}`).then(embedding => {
+        if (embedding.length > 0) {
+          this.productModel.findByIdAndUpdate(product._id, { embedding }).exec();
+        }
+      }).catch(err => console.error('Lỗi cập nhật embedding:', err));
+    }
+
+    const updatedProduct = await this.productModel
+      .findOneAndUpdate(
+        { _id: product._id, createdBy: new Types.ObjectId(ownerId) },
+        updatePayload,
+        { new: true },
+      )
+      .populate('categoryId', 'name slug')
+      .exec();
+
+    if (updateProductDto.stock !== undefined && updateProductDto.stock !== product.stock && updatedProduct) {
+      const stockChange = updateProductDto.stock - product.stock;
+      await this.inventoryLogsService.createLog(
+        product._id,
+        stockChange,
+        InventoryLogType.UPDATE,
+        undefined,
+        'Owner updated stock',
+      );
+    }
+
+    return updatedProduct;
+  }
+
+  async remove(id: number) {
+    const product = await this.productModel
+      .findOneAndUpdate(
+        { productId: id },
+        { status: ProductStatus.Deleted, deletedAt: new Date() },
+        { new: true },
+      )
+      .exec();
+
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+
+    return product;
+  }
+
+  async removeByOwner(id: number, ownerId: string) {
+    const product = await this.productModel
+      .findOneAndUpdate(
+        { productId: id, createdBy: new Types.ObjectId(ownerId) },
+        { status: ProductStatus.Deleted, deletedAt: new Date() },
+        { new: true },
+      )
+      .exec();
+
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+
+    return product;
+  }
+
+  async searchForAssistant(search: string) {
+    const terms = search.trim();
+    if (!terms) {
+      return this.productModel.find({ status: ProductStatus.Active }).populate('categoryId', 'name').limit(10).exec();
+    }
+
+    // Clean stop words from query text
+    const cleanQuery = terms
+      .replace(/loại nào tốt|giá bao nhiêu|là gì|tư vấn|báo giá|so sánh|cho tôi|có những|nào|loại/gi, '')
+      .trim();
+
+    const searchKeyword = cleanQuery || terms;
+    const searchRegex = new RegExp(searchKeyword, 'i');
+
+    const filter: FilterQuery<ProductDocument> = {
+      status: ProductStatus.Active,
+      $or: [
+        { name: searchRegex },
+        { description: searchRegex },
+        { brand: searchRegex }
+      ]
+    };
+
+    let results = await this.productModel.find(filter).populate('categoryId', 'name').limit(10).exec();
+
+    // Fallback: If regex exact phrase returns empty, try searching key tokens (e.g. "nồi", "chiên")
+    if (!results || results.length === 0) {
+      const tokens = searchKeyword.split(/\s+/).filter(t => t.length >= 3);
+      if (tokens.length > 0) {
+        const tokenRegexes = tokens.map(t => new RegExp(t, 'i'));
+        results = await this.productModel.find({
+          status: ProductStatus.Active,
+          $or: [
+            { name: { $in: tokenRegexes } },
+            { description: { $in: tokenRegexes } }
+          ]
+        }).populate('categoryId', 'name').limit(10).exec();
+      }
+    }
+
+    // Fallback if still empty: Return top active products
+    if (!results || results.length === 0) {
+      results = await this.productModel.find({ status: ProductStatus.Active }).populate('categoryId', 'name').limit(10).exec();
+    }
+
+    return results;
+  }
+
+  async suggestProducts(queryText: string) {
+    if (!queryText || queryText.trim().length < 2) return [];
+
+    const embedding = await this.aiService.generateEmbedding(queryText);
+    if (embedding.length > 0) {
+      // Dùng Vector Search của MongoDB Atlas
+      try {
+        const results = await this.productModel.aggregate([
+          {
+            $vectorSearch: {
+              index: "vector_index",
+              path: "embedding",
+              queryVector: embedding,
+              numCandidates: 100,
+              limit: 5
+            }
+          },
+          {
+            $match: { status: ProductStatus.Active }
+          },
+          {
+            $project: {
+              _id: 1,
+              productId: 1,
+              name: 1,
+              slug: 1,
+              price: 1,
+              images: 1,
+              score: { $meta: "vectorSearchScore" }
+            }
+          }
+        ]).exec();
+        
+        if (results && results.length > 0) {
+          return results.map(p => ({ ...p, id: p.productId }));
+        }
+      } catch (err) {
+        console.error('Vector search failed, falling back to text search:', (err as Error).message);
+      }
+    }
+
+    // Fallback: Text search
+    const filter: FilterQuery<ProductDocument> = {
+      status: ProductStatus.Active,
+      $text: { $search: queryText }
+    };
+    const fallbackResults = await this.productModel.find(filter)
+      .limit(5)
+      .select('_id productId name slug price images')
+      .lean()
+      .exec();
+      
+    return fallbackResults.map(p => ({ ...p, id: p.productId }));
+  }
+
+  private buildFilter(query: ProductQueryDto) {
+    const filter: FilterQuery<ProductDocument> = {};
+
+    if (query.search) {
+      filter.$text = { $search: query.search };
+    }
+
+    if (query.categoryId) {
+      filter.categoryId = new Types.ObjectId(query.categoryId);
+    }
+
+    if (query.ownerId) {
+      filter.createdBy = new Types.ObjectId(query.ownerId);
+    }
+
+
+    if (query.brand) {
+      filter.brand = new RegExp(query.brand, 'i');
+    }
+
+    if (query.status) {
+      filter.status = query.status;
+    } else {
+      filter.status = { $ne: ProductStatus.Deleted };
+    }
+
+    if (query.productType) {
+      filter.productType = query.productType;
+    }
+
+    if (query.minPrice !== undefined || query.maxPrice !== undefined) {
+      filter.price = {};
+      if (query.minPrice !== undefined) {
+        filter.price.$gte = query.minPrice;
+      }
+      if (query.maxPrice !== undefined) {
+        filter.price.$lte = query.maxPrice;
+      }
+    }
+
+    return filter;
+  }
+
+  private async ensureSlugAvailable(slug: string, ignoreId?: string) {
+    const existingProduct = await this.productModel.findOne({ slug }).exec();
+    if (existingProduct && existingProduct.id !== ignoreId) {
+      throw new BadRequestException('Product slug already exists');
+    }
+  }
+
+  private async getNextProductId() {
+    const counter = await this.counterModel
+      .findByIdAndUpdate(
+        'product',
+        { $inc: { sequence: 1 } },
+        { new: true, upsert: true, setDefaultsOnInsert: true },
+      )
+      .exec();
+
+    return counter.sequence;
+  }
+
+  private async assignIdsToExistingProducts() {
+    const highestProduct = await this.productModel
+      .findOne({ productId: { $exists: true } })
+      .sort({ productId: -1 })
+      .select('productId')
+      .lean()
+      .exec();
+
+    await this.counterModel
+      .findByIdAndUpdate(
+        'product',
+        { $max: { sequence: highestProduct?.productId || 0 } },
+        { upsert: true, setDefaultsOnInsert: true },
+      )
+      .exec();
+
+    const productsWithoutId = await this.productModel
+      .find({ productId: { $exists: false } })
+      .sort({ createdAt: 1, _id: 1 })
+      .select('_id')
+      .exec();
+
+    for (const product of productsWithoutId) {
+      const productId = await this.getNextProductId();
+      await this.productModel.updateOne({ _id: product._id }, { productId }).exec();
+    }
+  }
+
+  async createPriceSchedule(dto: CreatePriceScheduleDto, userId: string) {
+    const product = Types.ObjectId.isValid(dto.productId)
+      ? await this.productModel.findById(dto.productId).exec()
+      : await this.productModel.findOne({ productId: Number(dto.productId) }).exec();
+
+    if (!product) {
+      throw new NotFoundException('Sản phẩm không tồn tại');
+    }
+
+    const startDate = new Date(dto.startDate);
+    if (isNaN(startDate.getTime())) {
+      throw new BadRequestException('Ngày bắt đầu không hợp lệ');
+    }
+
+    let endDate: Date | undefined;
+    if (dto.type === PriceAdjustmentType.SALE_CAMPAIGN) {
+      if (!dto.endDate) {
+        throw new BadRequestException('Chiến dịch Sale bắt buộc phải chọn ngày kết thúc');
+      }
+      endDate = new Date(dto.endDate);
+      if (isNaN(endDate.getTime()) || endDate <= startDate) {
+        throw new BadRequestException('Ngày kết thúc phải diễn ra sau ngày bắt đầu');
+      }
+    }
+
+    // Tính toán giá calculatedPrice
+    let calculatedPrice = product.price;
+    const valueType = dto.valueType || DiscountValueType.FIXED_PRICE;
+
+    if (valueType === DiscountValueType.FIXED_PRICE) {
+      calculatedPrice = dto.value;
+    } else if (valueType === DiscountValueType.PERCENTAGE) {
+      calculatedPrice = Math.max(0, Math.round(product.price * (1 - dto.value / 100)));
+    } else if (valueType === DiscountValueType.AMOUNT_OFF) {
+      calculatedPrice = Math.max(0, Math.round(product.price - dto.value));
+    }
+
+    const schedule = await this.priceScheduleModel.create({
+      productId: product._id,
+      type: dto.type,
+      valueType,
+      value: dto.value,
+      calculatedPrice,
+      startDate,
+      endDate,
+      status: ScheduleStatus.PENDING,
+      title:
+        dto.title ||
+        (dto.type === PriceAdjustmentType.BASE_PRICE_CHANGE
+          ? 'Hạ giá gốc'
+          : 'Chương trình Sale Khuyến mãi'),
+      createdBy: new Types.ObjectId(userId),
+    });
+
+    // Kích hoạt quét tức thì nếu thời gian bắt đầu đã đến
+    void this.priceSchedulerService.processPriceSchedules();
+
+    return schedule;
+  }
+
+  async getPriceSchedulesByProduct(productIdParam: string) {
+    const product = Types.ObjectId.isValid(productIdParam)
+      ? await this.productModel.findById(productIdParam).select('_id').exec()
+      : await this.productModel.findOne({ productId: Number(productIdParam) }).select('_id').exec();
+
+    const productId = product ? product._id : productIdParam;
+
+    return this.priceScheduleModel
+      .find({ productId })
+      .sort({ createdAt: -1 })
+      .populate('createdBy', 'fullName email storeName')
+      .exec();
+  }
+
+  async cancelPriceSchedule(scheduleId: string, userId: string) {
+    const schedule = await this.priceScheduleModel.findById(scheduleId).exec();
+    if (!schedule) {
+      throw new NotFoundException('Không tìm thấy lịch trình điều chỉnh giá');
+    }
+
+    if (schedule.status === ScheduleStatus.CANCELLED || schedule.status === ScheduleStatus.EXPIRED) {
+      throw new BadRequestException('Lịch trình giá đã ở trạng thái kết thúc/hủy trước đó');
+    }
+
+    // Nếu đang ACTIVE đợt Sale, gỡ bỏ giá Sale trên sản phẩm
+    if (schedule.status === ScheduleStatus.ACTIVE && schedule.type === PriceAdjustmentType.SALE_CAMPAIGN) {
+      await this.productModel.findByIdAndUpdate(schedule.productId, {
+        $unset: { salePrice: 1, saleStartDate: 1, saleEndDate: 1 },
+      });
+    }
+
+    schedule.status = ScheduleStatus.CANCELLED;
+    await schedule.save();
+
+    return schedule;
+  }
+}
+
